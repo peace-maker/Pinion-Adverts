@@ -135,6 +135,7 @@ Changelog
 
 #define TEAM_SPEC 1
 #define MAX_AUTH_LENGTH 64
+#define DBPREFIX "" // "prefix_"
 
 enum
 {
@@ -211,6 +212,7 @@ new Handle:g_ConVarReView;
 new Handle:g_ConVarReViewTime;
 new Handle:g_ConVarImmunityEnabled;
 new Handle:g_ConVarTF2EventOption;
+new Handle:g_ConVarAdInterval;
 
 // Configuration
 new String:g_BaseURL[PLATFORM_MAX_PATH];
@@ -226,6 +228,10 @@ new EPlayerState:g_PlayerState[MAXPLAYERS+1] = {kAwaitingAd, ...};
 new bool:g_bPlayerActivated[MAXPLAYERS+1] = {false, ...};
 new Handle:g_hPlayerLastViewedAd = INVALID_HANDLE;
 new g_iLastAdWave = -1; // TODO: Reset this value to -1 when the last player leaves the server.
+
+new Handle:g_hDatabase;
+new String:g_sServerIP[16];
+new g_iServerPort;
 
 #define SECONDS_IN_MINUTE 60
 #define GetReViewTime() (GetConVarInt(g_ConVarReViewTime) * SECONDS_IN_MINUTE)
@@ -275,6 +281,7 @@ public OnPluginStart()
 	g_ConVarTF2EventOption = CreateConVar("sm_motdredirect_tf2_review_event", "1", "1: Ads show at start of round. 2: Ads show at end of round.'");
 	g_ConVarReViewTime = CreateConVar("sm_motdredirect_review_time", "30", "Duration (in minutes) until mid-map MOTD re-view", 0, true, 20.0);
 	g_ConVarImmunityEnabled = CreateConVar("sm_motdredirect_immunity_enable", "0", "Set to 1 to prevent displaying ads to users with access to 'advertisement_immunity'", 0, true, 0.0, true, 1.0);
+	g_ConVarAdInterval = CreateConVar("sm_motdredirect_adinterval", "45", "Don't show the advert to a player, if he already watched one x minutes ago.", 0, true, 0.0);
 	AutoExecConfig(true, "pinion_adverts");
 
 	// Version of plugin - Make visible to game-monitor.com - Dont store in configuration file
@@ -295,6 +302,16 @@ public OnPluginStart()
 	}
 	
 	SetupReView();
+	
+	// Setup database
+	if(SQL_CheckConfig("pinion"))
+	{
+		SQL_TConnect(SQL_OnConnect, "pinion");
+	}
+	else if(SQL_CheckConfig("default"))
+	{
+		SQL_TConnect(SQL_OnConnect, "default");
+	}
 	
 #if defined _updater_included
     if (LibraryExists("updater"))
@@ -442,6 +459,10 @@ public Action:Event_DoPageHit(Handle:timer, any:serial)
 		{
 			ShowMOTDPanelEx(client, "", "javascript:windowClosed()", MOTDPANEL_TYPE_URL, MOTDPANEL_CMD_NONE, false);
 		}
+		
+		// Remember when he last watched an ad.
+		if(IsClientAuthorized(client))
+			UpdateLastViewTime(client);
 	}
 }
 
@@ -668,61 +689,28 @@ public Action:LoadPage(Handle:timer, Handle:pack)
 		return Plugin_Stop;
 	}
 	
-	// Close the old motd's data. We're showing some ads now.
-	if(kv != INVALID_HANDLE)
-		CloseHandle(kv);
-	
-	kv = CreateKeyValues("data");
-
-	if (BGameUsesVGUIEnum())
+	// Database unavailable or feature disabled?
+	if(g_hDatabase == INVALID_HANDLE || GetConVarInt(g_ConVarAdInterval) <= 0)
 	{
-		KvSetNum(kv, "cmd", MOTDPANEL_CMD_CLOSED_HTMLPAGE);
-	}
-	else
-	{
-		KvSetString(kv, "cmd", "closed_htmlpage");
-	}
-
-	if (GetState(client) != kViewingAd)
-	{
-		decl String:szAuth[MAX_AUTH_LENGTH];
-		GetClientAuthString(client, szAuth, sizeof(szAuth));
-		
-		decl String:szURL[128];
-		Format(szURL, sizeof(szURL), "%s&steamid=%s&trigger=%i", g_BaseURL, szAuth, trigger);
-		
-		KvSetString(kv, "msg",	szURL);
-	}
-
-	if (g_Game == kGameCSGO)
-	{
-		KvSetString(kv, "title", MOTD_TITLE);
+		if(kv != INVALID_HANDLE)
+			CloseHandle(kv);
+		ShowAdToPlayer(client, trigger);
+		return Plugin_Stop;
 	}
 	
-	KvSetNum(kv, "type", MOTDPANEL_TYPE_URL);
+	// Check, when he last watched the ad.
+	new String:sAuth[33];
+	GetClientAuthString(client, sAuth, sizeof(sAuth));
 	
-	ShowVGUIPanelEx(client, "info", kv, true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
-	CloseHandle(kv);
+	new Handle:hDataPack = CreateDataPack();
+	WritePackCell(hDataPack, GetClientSerial(client));
+	WritePackCell(hDataPack, trigger);
+	WritePackCell(hDataPack, _:kv);
 	
-	new iCooldown = GetConVarInt(g_ConVarCooldown);
-	new bool:bUseCooldown = (g_Game != kGameCSGO && g_Game != kGameL4D2 && g_Game != kGameL4D && iCooldown != 0);
-	if (bUseCooldown && GetState(client) != kViewingAd)
-	{
-		new Handle:data;
-		CreateDataTimer(0.25, Timer_Restrict, data, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
-		WritePackCell(data, GetClientSerial(client));
-		WritePackFloat(data, GetGameTime());
-	}
+	decl String:sQuery[512];
+	Format(sQuery, sizeof(sQuery), "SELECT lastview FROM `%spinion_playerview` WHERE steamid REGEXP '^STEAM_[0-9]:%s$';", DBPREFIX, sAuth[8]);
+	SQL_TQuery(g_hDatabase, SQL_CheckLastViewTime, sQuery, hDataPack, DBPrio_High);
 	
-	if (!bUseCooldown)
-		ChangeState(client, kAdClosing);
-	else
-		ChangeState(client, kViewingAd);
-	
-	new Handle:pack2;
-	CreateDataTimer(120.0, ClosePage, pack2, TIMER_FLAG_NO_MAPCHANGE);
-	WritePackCell(pack2, GetClientSerial(client));
-	WritePackCell(pack2, trigger);
 	return Plugin_Stop;
 }
 
@@ -854,4 +842,200 @@ stock bool:BGameUsesVGUIEnum()
 		|| g_Game == kGameND
 		|| g_Game == kGameCSGO
 		;
+}
+
+// Shows the advert to the client
+ShowAdToPlayer(client, trigger)
+{
+	new Handle:kv = CreateKeyValues("data");
+
+	if (BGameUsesVGUIEnum())
+	{
+		KvSetNum(kv, "cmd", MOTDPANEL_CMD_CLOSED_HTMLPAGE);
+	}
+	else
+	{
+		KvSetString(kv, "cmd", "closed_htmlpage");
+	}
+
+	if (GetState(client) != kViewingAd)
+	{
+		decl String:szAuth[MAX_AUTH_LENGTH];
+		GetClientAuthString(client, szAuth, sizeof(szAuth));
+		
+		decl String:szURL[128];
+		Format(szURL, sizeof(szURL), "%s&steamid=%s&trigger=%i", g_BaseURL, szAuth, trigger);
+		
+		KvSetString(kv, "msg",	szURL);
+	}
+
+	if (g_Game == kGameCSGO)
+	{
+		KvSetString(kv, "title", MOTD_TITLE);
+	}
+	
+	KvSetNum(kv, "type", MOTDPANEL_TYPE_URL);
+	
+	ShowVGUIPanelEx(client, "info", kv, true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
+	CloseHandle(kv);
+	
+	new iCooldown = GetConVarInt(g_ConVarCooldown);
+	new bool:bUseCooldown = (g_Game != kGameCSGO && g_Game != kGameL4D2 && g_Game != kGameL4D && iCooldown != 0);
+	if (bUseCooldown && GetState(client) != kViewingAd)
+	{
+		new Handle:data;
+		CreateDataTimer(0.25, Timer_Restrict, data, TIMER_REPEAT|TIMER_FLAG_NO_MAPCHANGE);
+		WritePackCell(data, GetClientSerial(client));
+		WritePackFloat(data, GetGameTime());
+	}
+	
+	if (!bUseCooldown)
+		ChangeState(client, kAdClosing);
+	else
+		ChangeState(client, kViewingAd);
+	
+	new Handle:pack2;
+	CreateDataTimer(120.0, ClosePage, pack2, TIMER_FLAG_NO_MAPCHANGE);
+	WritePackCell(pack2, GetClientSerial(client));
+	WritePackCell(pack2, trigger);
+}
+
+// Remember, when the client last viewed an add
+stock UpdateLastViewTime(client)
+{
+	if(g_hDatabase == INVALID_HANDLE)
+		return;
+	
+	new String:sAuth[33];
+	GetClientAuthString(client, sAuth, sizeof(sAuth));
+	
+	decl String:sQuery[512];
+	Format(sQuery, sizeof(sQuery), "REPLACE INTO `%spinion_playerview` (steamid, lastview) VALUES (\"%s\", %d);", DBPREFIX, sAuth, GetTime());
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+	
+	// For own tracking purposes..
+	Format(sQuery, sizeof(sQuery), "SELECT impressions FROM `%spinion_statistics` WHERE ip = \"%s\" AND port = %d AND date = CURDATE();", DBPREFIX, g_sServerIP, g_iServerPort);
+	SQL_TQuery(g_hDatabase, SQL_CheckImpressions, sQuery);
+}
+
+// SQL Stuff
+public SQL_OnConnect(Handle:owner, Handle:hndl, const String:error[], any:data)
+{
+	if(hndl == INVALID_HANDLE || strlen(error) > 0)
+	{
+		LogError("Error connecting to database: %s", error);
+		return;
+	}
+	
+	g_hDatabase = hndl;
+	
+	// Save serverip and serverport
+	g_iServerPort = GetConVarInt(FindConVar("hostport"));
+	new iServerIPLong = GetConVarInt(FindConVar("hostip"));
+	Format(g_sServerIP, sizeof(g_sServerIP), "%d.%d.%d.%d", (iServerIPLong>>24)&0xff, (iServerIPLong>>16)&0xff, (iServerIPLong>>8)&0xff, iServerIPLong&0xff);
+	
+	decl String:sQuery[512];
+	Format(sQuery, sizeof(sQuery), "CREATE TABLE IF NOT EXISTS `%spinion_playerview` (\
+									  `steamid` varchar(33) NOT NULL,\
+									  `lastview` int(11) NOT NULL,\
+									  PRIMARY KEY  (`steamid`)\
+									) ENGINE=MyISAM DEFAULT CHARSET=utf8;", DBPREFIX);
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+	
+	Format(sQuery, sizeof(sQuery), "CREATE TABLE IF NOT EXISTS `%spinion_statistics` (\
+									  `ip` varchar(64) NOT NULL,\
+									  `port` int(11) NOT NULL,\
+									  `date` date NOT NULL,\
+									  `impressions` int(11) NOT NULL,\
+									  PRIMARY KEY  (`ip`,`port`,`date`),\
+									  KEY `impressions` (`impressions`)\
+									) ENGINE=MyISAM DEFAULT CHARSET=utf8;", DBPREFIX);
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+}
+
+public SQL_CheckLastViewTime(Handle:owner, Handle:hndl, const String:error[], any:pack)
+{
+	ResetPack(pack);
+	new client = GetClientFromSerial(ReadPackCell(pack));
+	new trigger = ReadPackCell(pack);
+	new Handle:kv = Handle:ReadPackCell(pack);
+	CloseHandle(pack);
+	
+	if(!client)
+		return;
+	
+	if(hndl == INVALID_HANDLE || strlen(error) > 0)
+	{
+		if(kv != INVALID_HANDLE)
+			CloseHandle(kv);
+		ShowAdToPlayer(client, trigger);
+		LogError("Error getting last view time for player %N: %s", client, error);
+		return;
+	}
+	
+	// He never watched an ad before. Just show it.
+	if(SQL_GetRowCount(hndl) == 0 || !SQL_FetchRow(hndl))
+	{
+		if(kv != INVALID_HANDLE)
+			CloseHandle(kv);
+		ShowAdToPlayer(client, trigger);
+		return;
+	}
+	
+	new iLastViewTime = SQL_FetchInt(hndl, 0);
+	new iInterval = GetConVarInt(g_ConVarAdInterval) * 60;
+	if(iInterval <= 0) // Disabled?
+	{
+		if(kv != INVALID_HANDLE)
+			CloseHandle(kv);
+		ShowAdToPlayer(client, trigger);
+		return;
+	}
+	
+	// Player watched the advert recently. Don't disturb him again now.
+	if((GetTime() - iLastViewTime) < iInterval)
+	{
+		ChangeState(client, kAdDone);
+		if(kv != INVALID_HANDLE)
+		{
+			ShowVGUIPanelEx(client, "info", kv, true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
+			CloseHandle(kv);
+		}
+		return;
+	}
+	
+	if(kv != INVALID_HANDLE)
+		CloseHandle(kv);
+	
+	// He didn't watch it recently. Have him watch now.
+	ShowAdToPlayer(client, trigger);
+}
+
+public SQL_CheckImpressions(Handle:owner, Handle:hndl, const String:error[], any:data)
+{
+	if(hndl == INVALID_HANDLE || strlen(error) > 0)
+	{
+		LogError("Error checking impressions: %s", error);
+		return;
+	}
+	
+	decl String:sQuery[256];
+	if(SQL_GetRowCount(hndl) == 0)
+	{
+		Format(sQuery, sizeof(sQuery), "INSERT INTO `%spinion_statistics` (ip, port, date, impressions) VALUES (\"%s\", %d, CURDATE(), 1);", DBPREFIX, g_sServerIP, g_iServerPort);
+	}
+	else
+	{
+		Format(sQuery, sizeof(sQuery), "UPDATE `%spinion_statistics` SET impressions = impressions+1 WHERE ip = \"%s\" AND port = %d AND date = CURDATE();", DBPREFIX, g_sServerIP, g_iServerPort);
+	}
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+}
+
+public SQL_DoNothing(Handle:owner, Handle:hndl, const String:error[], any:data)
+{
+	if(hndl == INVALID_HANDLE || strlen(error) > 0)
+	{
+		LogError("Error updating time or statistics: %s", error);
+		return;
+	}
 }
