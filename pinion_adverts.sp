@@ -580,6 +580,22 @@ public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:bf, const players[], playersN
 	CreateDataTimer(0.1, LoadPage, pack, TIMER_FLAG_NO_MAPCHANGE);
 	WritePackCell(pack, GetClientSerial(players[0]));
 	WritePackCell(pack, AD_TRIGGER_CONNECT);
+	
+	BfReadByte(bf); //show
+	
+	// Remember the key value data of this vguimenu. That way we can display the old motd, if the client already watched an advert recently
+	new Handle:kv = CreateKeyValues("data");
+	WritePackCell(pack, _:kv);
+	
+	new iKeyCount = BfReadByte(bf);
+	decl String:key[128], String:value[128];
+	while(iKeyCount-- > 0)
+	{
+		BfReadString(bf, key, sizeof(key), true);
+		BfReadString(bf, value, sizeof(value), true);
+		KvSetString(kv, key, value);
+	}
+	KvRewind(kv);
 
 	return Plugin_Handled;
 }
@@ -626,14 +642,37 @@ public Action:LoadPage(Handle:timer, Handle:pack)
 	ResetPack(pack);
 	new client = GetClientFromSerial(ReadPackCell(pack));
 	new trigger = ReadPackCell(pack);
+	new Handle:kv;
+	if(trigger == _:AD_TRIGGER_CONNECT)
+	{
+		kv = Handle:ReadPackCell(pack);
+	}
 	
 	if (!client || (g_Game == kGameCSGO && GetState(client) == kViewingAd))
+	{
+		if(kv != INVALID_HANDLE)
+			CloseHandle(kv);
 		return Plugin_Stop;
+	}
 	
 	if (GetConVarBool(g_ConVarImmunityEnabled) && CheckCommandAccess(client, "advertisement_immunity", ADMFLAG_RESERVATION, true))
+	{
+		// This guy now officially "viewed" the advert.
+		ChangeState(client, kAdDone);
+		if(kv != INVALID_HANDLE)
+		{
+			// Show the old motd
+			ShowVGUIPanelEx(client, "info", kv, true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
+			CloseHandle(kv);
+		}
 		return Plugin_Stop;
+	}
 	
-	new Handle:kv = CreateKeyValues("data");
+	// Close the old motd's data. We're showing some ads now.
+	if(kv != INVALID_HANDLE)
+		CloseHandle(kv);
+	
+	kv = CreateKeyValues("data");
 
 	if (BGameUsesVGUIEnum())
 	{
