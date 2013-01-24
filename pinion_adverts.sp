@@ -21,7 +21,11 @@ Configuration Variables: See pinion_adverts.cfg.
 ------------------------------------------------------------------------------------------------------------------------------------
 
 Changelog
-	 1.12.12 <-> 2012 12/12 - Caelan Borowiec
+	1.12.13 <-> 2013 1/20 - Caelan Borowiec
+		Patched a possible memory leak
+		Improved player immunity handling
+		Added immunity for inital connection advert's delay timer
+	1.12.12 <-> 2012 12/12 - Caelan Borowiec
 		Version bump
 	1.8.2-pre-12 <-> 2012 12/7 - Caelan Borowiec
 		Fixed a bug that would prevent a player from seeing the jointeam menu if they idled too long after joining the server (For real this time).
@@ -129,7 +133,7 @@ Changelog
 #include <sdktools>
 
 #undef REQUIRE_PLUGIN
-#tryinclude <updater>
+//#tryinclude <updater>
 
 #pragma semicolon 1
 
@@ -159,7 +163,7 @@ enum loadTigger
 };
 
 // Plugin definitions
-#define PLUGIN_VERSION "1.12.12"
+#define PLUGIN_VERSION "1.12.13"
 public Plugin:myinfo =
 {
 	name = "Pinion Adverts",
@@ -593,7 +597,11 @@ public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:bf, const players[], playersN
 		return Plugin_Continue;
 
 	decl String:buffer[64];
-	BfReadString(bf, buffer, sizeof(buffer));
+	if (GetFeatureStatus(FeatureType_Native, "GetUserMessageType") == FeatureStatus_Available && GetUserMessageType() == UM_Protobuf)
+		PbReadString(self, "name", buffer, sizeof(buffer));
+	else
+		BfReadString(self, buffer, sizeof(buffer));
+	
 	if (strcmp(buffer, "info") != 0)
 		return Plugin_Continue;
 	
@@ -602,19 +610,37 @@ public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:bf, const players[], playersN
 	WritePackCell(pack, GetClientSerial(players[0]));
 	WritePackCell(pack, AD_TRIGGER_CONNECT);
 	
-	BfReadByte(bf); //show
+	if (GetFeatureStatus(FeatureType_Native, "GetUserMessageType") == FeatureStatus_Available && GetUserMessageType() == UM_Protobuf)
+		PbReadBool(self, "show");
+	else
+		BfReadByte(self); //show
 	
 	// Remember the key value data of this vguimenu. That way we can display the old motd, if the client already watched an advert recently
 	new Handle:kv = CreateKeyValues("data");
 	WritePackCell(pack, _:kv);
 	
-	new iKeyCount = BfReadByte(bf);
-	decl String:key[128], String:value[128];
-	while(iKeyCount-- > 0)
+	if (GetFeatureStatus(FeatureType_Native, "GetUserMessageType") == FeatureStatus_Available && GetUserMessageType() == UM_Protobuf)
 	{
-		BfReadString(bf, key, sizeof(key), true);
-		BfReadString(bf, value, sizeof(value), true);
-		KvSetString(kv, key, value);
+		decl String:key[128], String:value[128];
+		new count = PbGetRepeatedFieldCount(self, "subkeys");
+		for(new i=0;i<count;i++)
+		{
+			new Handle:subkey = PbReadRepeatedMessage(self, "subkeys", i);
+			PbReadString(subkey, "name", key, sizeof(key));
+			PbReadString(subkey, "str", value, sizeof(value));
+			KvSetString(kv, key, value);
+		}
+	}
+	else
+	{
+		new iKeyCount = BfReadByte(self);
+		decl String:key[128], String:value[128];
+		while(iKeyCount-- > 0)
+		{
+			BfReadString(self, key, sizeof(key), true);
+			BfReadString(self, value, sizeof(value), true);
+			KvSetString(kv, key, value);
+		}
 	}
 	KvRewind(kv);
 
@@ -734,43 +760,69 @@ public Action:ClosePage(Handle:timer, Handle:pack)
 
 ShowVGUIPanelEx(client, const String:name[], Handle:kv=INVALID_HANDLE, bool:show=true, usermessageFlags=0)
 {
-	new Handle:bf = StartMessageOne("VGUIMenu", client, usermessageFlags);
-	BfWriteString(bf, name);
-	BfWriteByte(bf, show);
+	new Handle:msg = StartMessageOne("VGUIMenu", client, usermessageFlags);
 	
-	if (kv == INVALID_HANDLE)
+	if (GetFeatureStatus(FeatureType_Native, "GetUserMessageType") == FeatureStatus_Available && GetUserMessageType() == UM_Protobuf)
 	{
-		BfWriteByte(bf, 0);
-	}
-	else
-	{	
-		if (!KvGotoFirstSubKey(kv, false))
+		PbSetString(msg, "name", name);
+		PbSetBool(msg, "show", true);
+
+		if (kv != INVALID_HANDLE && KvGotoFirstSubKey(kv, false))
 		{
-			BfWriteByte(bf, 0);
-		}
-		else
-		{
-			new keyCount = 0;
+			new Handle:subkey;
+
 			do
 			{
-				++keyCount;
+				decl String:key[128], String:value[128];
+				KvGetSectionName(kv, key, sizeof(key));
+				KvGetString(kv, NULL_STRING, value, sizeof(value), "");
+				
+				subkey = PbAddMessage(msg, "subkeys");
+				PbSetString(subkey, "name", key);
+				PbSetString(subkey, "str", value);
+
 			} while (KvGotoNextKey(kv, false));
-			
-			BfWriteByte(bf, keyCount);
-			
-			if (keyCount > 0)
+		}
+	}
+	else //BitBuffer
+	{
+		BfWriteString(msg, name);
+		BfWriteByte(msg, show);
+		
+		if (kv == INVALID_HANDLE)
+		{
+			BfWriteByte(msg, 0);
+		}
+		else
+		{	
+			if (!KvGotoFirstSubKey(kv, false))
 			{
-				KvGoBack(kv);
-				KvGotoFirstSubKey(kv, false);
+				BfWriteByte(msg, 0);
+			}
+			else
+			{
+				new keyCount = 0;
 				do
 				{
-					decl String:key[128], String:value[128];
-					KvGetSectionName(kv, key, sizeof(key));
-					KvGetString(kv, NULL_STRING, value, sizeof(value), "");
-					
-					BfWriteString(bf, key);
-					BfWriteString(bf, value);
+					++keyCount;
 				} while (KvGotoNextKey(kv, false));
+				
+				BfWriteByte(msg, keyCount);
+				
+				if (keyCount > 0)
+				{
+					KvGoBack(kv);
+					KvGotoFirstSubKey(kv, false);
+					do
+					{
+						decl String:key[128], String:value[128];
+						KvGetSectionName(kv, key, sizeof(key));
+						KvGetString(kv, NULL_STRING, value, sizeof(value), "");
+						
+						BfWriteString(msg, key);
+						BfWriteString(msg, value);
+					} while (KvGotoNextKey(kv, false));
+				}
 			}
 		}
 	}
@@ -867,6 +919,11 @@ ShowAdToPlayer(client, trigger)
 		Format(szURL, sizeof(szURL), "%s&steamid=%s&trigger=%i", g_BaseURL, szAuth, trigger);
 		
 		KvSetString(kv, "msg",	szURL);
+		
+		new Handle:pack2;
+		CreateDataTimer(120.0, ClosePage, pack2, TIMER_FLAG_NO_MAPCHANGE);
+		WritePackCell(pack2, GetClientSerial(client));
+		WritePackCell(pack2, trigger);
 	}
 
 	if (g_Game == kGameCSGO)
@@ -893,11 +950,6 @@ ShowAdToPlayer(client, trigger)
 		ChangeState(client, kAdClosing);
 	else
 		ChangeState(client, kViewingAd);
-	
-	new Handle:pack2;
-	CreateDataTimer(120.0, ClosePage, pack2, TIMER_FLAG_NO_MAPCHANGE);
-	WritePackCell(pack2, GetClientSerial(client));
-	WritePackCell(pack2, trigger);
 }
 
 // Remember, when the client last viewed an add
