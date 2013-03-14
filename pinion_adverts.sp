@@ -21,6 +21,10 @@ Configuration Variables: See pinion_adverts.cfg.
 ------------------------------------------------------------------------------------------------------------------------------------
 
 Changelog
+	1.12.15 <-> 2013 2/6 - Caelan Borowiec
+		Added dynamic minimum durations
+	1.12.14 <-> 2013 1/24 - Caelan Borowiec
+		Updated code to use CS:GO's new protobuff methods (Fixes the plugin not functioning in CS:GO).
 	1.12.13 <-> 2013 1/20 - Caelan Borowiec
 		Patched a possible memory leak
 		Improved player immunity handling
@@ -131,6 +135,9 @@ Changelog
 
 #include <sourcemod>
 #include <sdktools>
+#include <socket>
+#include <geoip>
+#include <flashversion>
 
 #undef REQUIRE_PLUGIN
 //#tryinclude <updater>
@@ -140,6 +147,7 @@ Changelog
 #define TEAM_SPEC 1
 #define MAX_AUTH_LENGTH 64
 #define DBPREFIX "" // "prefix_"
+//#define SHOW_CONSOLE_MESSAGES
 
 enum
 {
@@ -152,18 +160,17 @@ enum
 	MOTDPANEL_CMD_CHOOSE_TEAM,
 };
 
-// TODO: Ad trigger detection
 enum loadTigger
 {
-	AD_TRIGGER_UNDEFINED = 0,
-	AD_TRIGGER_CONNECT,
-	AD_TRIGGER_PLAYER_TRANSITION,
-	AD_TRIGGER_GLOBAL_TIMER,
-	AD_TRIGGER_GLOBAL_TIMER_ROUNDEND,
+	AD_TRIGGER_UNDEFINED = 0,						// No data, this should never happen
+	AD_TRIGGER_CONNECT,								// Player joined the server
+	AD_TRIGGER_PLAYER_TRANSITION,				// L4D/L4D2 player regained control of a character after a stage transition
+	AD_TRIGGER_GLOBAL_TIMER,						// Not currently used
+	AD_TRIGGER_GLOBAL_TIMER_ROUNDEND,		// Re-view advertisement triggered at round end/round start
 };
 
 // Plugin definitions
-#define PLUGIN_VERSION "1.12.13"
+#define PLUGIN_VERSION "1.12.15"
 public Plugin:myinfo =
 {
 	name = "Pinion Adverts",
@@ -173,9 +180,10 @@ public Plugin:myinfo =
 	url = "http://www.pinion.gg/"
 };
 
-// Approximately 5 seconds from MotD display.
-// Time starts from player_activate, a few seconds after Motd is sent, but a few seconds before it actually loads
-//#define WAIT_TIME 8
+// The number of times to attempt to query adback.pinion.gg
+#define MAX_QUERY_ATTEMPTS 10
+//The number of seconds to delay between failed query attempts
+#define QUERY_DELAY 3.0
 
 // Some games require a title to explicitly be set (while others don't even show the set title)
 #define MOTD_TITLE "Sponsor Message"
@@ -212,23 +220,33 @@ new EGame:g_Game = kGameUnsupported;
 // Console Variables
 new Handle:g_ConVar_URL;
 new Handle:g_ConVarCooldown;
+new Handle:g_ConVarMaxCooldown;
 new Handle:g_ConVarReView;
 new Handle:g_ConVarReViewTime;
 new Handle:g_ConVarImmunityEnabled;
 new Handle:g_ConVarTF2EventOption;
 new Handle:g_ConVarAdInterval;
 
+// Globals required/used by dynamic delay code
+new g_iCurrentIteration[MAXPLAYERS +1];
+new g_iNumQueryAttempts[MAXPLAYERS +1] = 1;
+new g_iDynamicDisplayTime[MAXPLAYERS +1] = 0;
+new bool:g_iIsMapActive = false;
+
 // Configuration
 new String:g_BaseURL[PLATFORM_MAX_PATH];
 
 enum EPlayerState
 {
+	kQueryingHTMLMotd,// cl_disablehtmlmotd is currently being checked
+	kCheckFlash,  // flash version hasn't been checked yet.
+	kCheckingFlash,// flash version is currently being checked
 	kAwaitingAd,  // have not seen ad yet for this map
 	kViewingAd,   // ad has been deplayed
 	kAdClosing,   // ad is allowed to close
 	kAdDone,      // done with ad for this map
 }
-new EPlayerState:g_PlayerState[MAXPLAYERS+1] = {kAwaitingAd, ...};
+new EPlayerState:g_PlayerState[MAXPLAYERS+1] = {kQueryingHTMLMotd, ...};
 new bool:g_bPlayerActivated[MAXPLAYERS+1] = {false, ...};
 new Handle:g_hPlayerLastViewedAd = INVALID_HANDLE;
 new g_iLastAdWave = -1; // TODO: Reset this value to -1 when the last player leaves the server.
@@ -237,11 +255,28 @@ new Handle:g_hDatabase;
 new String:g_sServerIP[16];
 new g_iServerPort;
 
+new String:g_sSupportedCountries[][] = {"United States", "Canada", "United Kingdom", "Germany", "Italy", "France", "Spain", "Switzerland", "Holland", "Australia", "New Zealand"};
+new bool:g_bErrorGettingFlash[MAXPLAYERS+1];
+new g_iFlashVersion[MAXPLAYERS+1][4];
+
+enum HTMLMOTD {
+	bool:bChecked,
+	bool:bSuccess,
+	bool:bIsDisabled,
+	Handle:hQueryTimeout
+}
+new g_PlayerHasHTMLDisabled[MAXPLAYERS+1][HTMLMOTD];
+new Handle:g_hDefaultMOTD[MAXPLAYERS+1];
+new bool:g_bStatsTracked[MAXPLAYERS+1];
+
 #define SECONDS_IN_MINUTE 60
 #define GetReViewTime() (GetConVarInt(g_ConVarReViewTime) * SECONDS_IN_MINUTE)
 
 public APLRes:AskPluginLoad2(Handle:myself, bool:late, String:error[], err_max)
 {
+	// Backwards compatibility pre csgo/sm1.5
+	MarkNativeAsOptional("GetUserMessageType");
+	
 	// Game Detection
 	decl String:szGameDir[32];
 	GetGameFolderName(szGameDir, sizeof(szGameDir));
@@ -280,7 +315,8 @@ public OnPluginStart()
 	
 	// Specify console variables used to configure plugin
 	g_ConVar_URL = CreateConVar("sm_motdredirect_url", "", "Target URL to replace MOTD");
-	g_ConVarCooldown = CreateConVar("sm_motdredirect_force_min_duration", "25", "Prevent the MOTD from being closed for this many seconds (min: 15 sec, 0 = disabled).", 0, true, 0.0, true, 30.0);
+	g_ConVarCooldown = CreateConVar("sm_motdredirect_force_min_duration", "25", "Prevent the MOTD from being closed for this many seconds (Min: 15 sec, Max: 30 sec, 0 = Disables).", 0, true, 0.0, true, 30.0);
+	g_ConVarMaxCooldown = CreateConVar("sm_motdredirect_max_forced_duration", "-1", "The maximum amount of time the MOTD will be forced to remain open (Min: 15 sec. Max: 30 sec. 0 = no forced waiting).", 0, true, 0.0, true, 30.0);
 	g_ConVarReView = CreateConVar("sm_motdredirect_review", "0", "Set clients to re-view ad next round if they have not seen it recently");
 	g_ConVarTF2EventOption = CreateConVar("sm_motdredirect_tf2_review_event", "1", "1: Ads show at start of round. 2: Ads show at end of round.'");
 	g_ConVarReViewTime = CreateConVar("sm_motdredirect_review_time", "30", "Duration (in minutes) until mid-map MOTD re-view", 0, true, 20.0);
@@ -392,7 +428,8 @@ public OnAllPluginsLoaded()
 				new String:sDataEscape[128];
 				strcopy(sDataEscape, sizeof(sDataEscape), sData);
 				ReplaceString(sDataEscape, sizeof(sDataEscape), " ", "+");
-				WriteFileLine(hMOTD, "<meta http-equiv='Refresh' content='0; url=http://google.com/?q=%s'>", sDataEscape);
+				//WriteFileLine(hMOTD, "<meta http-equiv='Refresh' content='0; url=http://google.com/?q=%s'>", sDataEscape);
+				WriteFileLine(hMOTD, "Pinion cannot run while %s is loaded. Please remove \"%s\" to use this plugin.", sData, sData);
 			}
 			CloseHandle(hMOTD);
 		}
@@ -443,10 +480,77 @@ SetupReView()
 
 public OnClientConnected(client)
 {
-	ChangeState(client, kAwaitingAd);
+	ChangeState(client, kQueryingHTMLMotd);
 	g_bPlayerActivated[client] = false;
+	g_bErrorGettingFlash[client] = false;
+	g_PlayerHasHTMLDisabled[client][bChecked] = false;
 }
 
+public OnClientPutInServer(client)
+{
+	if(!IsFakeClient(client))
+	{
+		// Check, if the client has html motds disabled.
+		QueryClientConVar(client, "cl_disablehtmlmotd", CVQuery_CheckHTMLDisabled);
+		g_PlayerHasHTMLDisabled[client][hQueryTimeout] = CreateTimer(3.0, Timer_ClientQueryTimeout, GetClientSerial(client), TIMER_FLAG_NO_MAPCHANGE);
+	}
+}
+
+public OnClientDisconnect(client)
+{
+	if(g_PlayerHasHTMLDisabled[client][hQueryTimeout] != INVALID_HANDLE)
+	{
+		CloseHandle(g_PlayerHasHTMLDisabled[client][hQueryTimeout]);
+		g_PlayerHasHTMLDisabled[client][hQueryTimeout] = INVALID_HANDLE;
+	}
+	if(g_hDefaultMOTD[client] != INVALID_HANDLE)
+	{
+		CloseHandle(g_hDefaultMOTD[client]);
+		g_hDefaultMOTD[client] = INVALID_HANDLE;
+	}
+	
+	g_bStatsTracked[client] = false;
+}
+
+public Action:Timer_ClientQueryTimeout(Handle:timer, any:serial)
+{
+	new client = GetClientFromSerial(serial);
+	if(!client)
+		return Plugin_Handled;
+	
+	g_PlayerHasHTMLDisabled[client][hQueryTimeout] = INVALID_HANDLE;
+	g_PlayerHasHTMLDisabled[client][bChecked] = true;
+	g_PlayerHasHTMLDisabled[client][bSuccess] = false;
+	
+	CheckHTMLMotdDisabled(client, AD_TRIGGER_CONNECT);
+	
+	return Plugin_Handled;
+}
+
+public CVQuery_CheckHTMLDisabled(QueryCookie:cookie, client, ConVarQueryResult:result, const String:cvarName[], const String:cvarValue[])
+{
+	if(!IsClientConnected(client))
+		return;
+	
+	g_PlayerHasHTMLDisabled[client][bChecked] = true;
+	
+	if(g_PlayerHasHTMLDisabled[client][hQueryTimeout] != INVALID_HANDLE)
+	{
+		CloseHandle(g_PlayerHasHTMLDisabled[client][hQueryTimeout]);
+		g_PlayerHasHTMLDisabled[client][hQueryTimeout] = INVALID_HANDLE;
+	}
+	
+	if(result != ConVarQuery_Okay)
+	{
+		g_PlayerHasHTMLDisabled[client][bSuccess] = false;
+		CheckHTMLMotdDisabled(client, AD_TRIGGER_CONNECT);
+		return;
+	}
+	
+	g_PlayerHasHTMLDisabled[client][bSuccess] = true;
+	g_PlayerHasHTMLDisabled[client][bIsDisabled] = StrEqual(cvarValue, "1");
+	CheckHTMLMotdDisabled(client, AD_TRIGGER_CONNECT);
+}
 
 public Action:Event_DoPageHit(Handle:timer, any:serial)
 {
@@ -456,12 +560,24 @@ public Action:Event_DoPageHit(Handle:timer, any:serial)
 	{
 		if (g_Game == kGameCSGO)
 		{
+			#if defined SHOW_CONSOLE_MESSAGES
+			PrintToConsole(client, "Sending javascript:windowClosed() to client.");
+			#endif
 			ShowMOTDPanelEx(client, MOTD_TITLE, "javascript:windowClosed()", MOTDPANEL_TYPE_URL, MOTDPANEL_CMD_NONE, true);
 			FakeClientCommand(client, "joingame");
+			#if defined SHOW_CONSOLE_MESSAGES
+			PrintToConsole(client, "javascript:windowClosed() sent to client.");
+			#endif
 		}
 		else
 		{
+			#if defined SHOW_CONSOLE_MESSAGES
+			PrintToConsole(client, "Sending javascript:windowClosed() to client.");
+			#endif
 			ShowMOTDPanelEx(client, "", "javascript:windowClosed()", MOTDPANEL_TYPE_URL, MOTDPANEL_CMD_NONE, false);
+			#if defined SHOW_CONSOLE_MESSAGES
+			PrintToConsole(client, "javascript:windowClosed() sent to client.");
+			#endif
 		}
 		
 		// Remember when he last watched an ad.
@@ -471,7 +587,7 @@ public Action:Event_DoPageHit(Handle:timer, any:serial)
 }
 
 // Extended ShowMOTDPanel with options for Command and Show
-stock ShowMOTDPanelEx(client, const String:title[], const String:msg[], type=MOTDPANEL_TYPE_INDEX, cmd=MOTDPANEL_CMD_NONE, bool:show=true)
+stock ShowMOTDPanelEx(client, const String:title[], const String:msg[], type=MOTDPANEL_TYPE_INDEX, cmd=MOTDPANEL_CMD_NONE, bool:show=true, usermessageFlags=0)
 {
 	new Handle:Kv = CreateKeyValues("data");
 
@@ -479,7 +595,7 @@ stock ShowMOTDPanelEx(client, const String:title[], const String:msg[], type=MOT
 	KvSetNum(Kv, "type", type);
 	KvSetString(Kv, "msg", msg);
 	KvSetNum(Kv, "cmd", cmd);	//http://forums.alliedmods.net/showthread.php?p=1220212
-	ShowVGUIPanel(client, "info", Kv, show);
+	ShowVGUIPanelEx(client, "info", Kv, show, usermessageFlags);
 	CloseHandle(Kv);
 }
 
@@ -492,6 +608,12 @@ public Event_PlayerActivate(Handle:event, const String:name[], bool:dontBroadcas
 public OnMapEnd()
 {
 	g_iLastAdWave = -1;	// Reset the value so adverts aren't triggered the first round after a map load
+	g_iIsMapActive = false;
+}
+
+public OnMapStart()
+{
+	g_iIsMapActive = true;
 }
 
 public Event_HandleReview(Handle:event, const String:name[], bool:dontBroadcast)
@@ -518,8 +640,8 @@ public Event_HandleReview(Handle:event, const String:name[], bool:dontBroadcast)
 				continue;
 
 			ChangeState(i, kAwaitingAd);
-			new Handle:pack;
-			CreateDataTimer(2.0, LoadPage, pack, TIMER_FLAG_NO_MAPCHANGE);
+			new Handle:pack = CreateDataPack();
+			CreateTimer(2.0, LoadPage, pack, TIMER_FLAG_NO_MAPCHANGE);
 			WritePackCell(pack, GetClientSerial(i));
 			WritePackCell(pack, AD_TRIGGER_GLOBAL_TIMER_ROUNDEND);
 		}
@@ -581,21 +703,21 @@ public Action:Event_PlayerTransitioned(Handle:event, const String:name[], bool:d
 		return;
 
 	ChangeState(client, kAwaitingAd);
-	new Handle:pack;
-	CreateDataTimer(2.0, LoadPage, pack, TIMER_FLAG_NO_MAPCHANGE);
+	new Handle:pack = CreateDataPack();
+	CreateTimer(2.0, LoadPage, pack, TIMER_FLAG_NO_MAPCHANGE);
 	WritePackCell(pack, GetClientSerial(client));
 	WritePackCell(pack, AD_TRIGGER_PLAYER_TRANSITION);
 	
 	SetTrieValue(g_hPlayerLastViewedAd, SteamID, GetTime());
 }
 
-public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:bf, const players[], playersNum, bool:reliable, bool:init)
+public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:self, const players[], playersNum, bool:reliable, bool:init)
 {
 	new client = players[0];
 	if (playersNum > 1 || !IsClientInGame(client) || IsFakeClient(client)
-		|| (GetState(client) != kAwaitingAd && GetState(client) != kViewingAd))
+		|| (GetState(client) != kAwaitingAd && GetState(client) != kViewingAd && GetState(client) != kCheckFlash && GetState(client) != kQueryingHTMLMotd))
 		return Plugin_Continue;
-
+		
 	decl String:buffer[64];
 	if (GetFeatureStatus(FeatureType_Native, "GetUserMessageType") == FeatureStatus_Available && GetUserMessageType() == UM_Protobuf)
 		PbReadString(self, "name", buffer, sizeof(buffer));
@@ -605,19 +727,24 @@ public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:bf, const players[], playersN
 	if (strcmp(buffer, "info") != 0)
 		return Plugin_Continue;
 	
-	new Handle:pack;
-	CreateDataTimer(0.1, LoadPage, pack, TIMER_FLAG_NO_MAPCHANGE);
-	WritePackCell(pack, GetClientSerial(players[0]));
-	WritePackCell(pack, AD_TRIGGER_CONNECT);
+	if(GetState(client) != kQueryingHTMLMotd)
+	{
+		new Handle:pack = CreateDataPack();
+		CreateTimer(0.1, LoadPage, pack, TIMER_FLAG_NO_MAPCHANGE);
+		WritePackCell(pack, GetClientSerial(players[0]));
+		WritePackCell(pack, AD_TRIGGER_CONNECT);
+	}
 	
 	if (GetFeatureStatus(FeatureType_Native, "GetUserMessageType") == FeatureStatus_Available && GetUserMessageType() == UM_Protobuf)
 		PbReadBool(self, "show");
 	else
 		BfReadByte(self); //show
 	
+	if(g_hDefaultMOTD[client] != INVALID_HANDLE)
+		return Plugin_Continue;
+	
 	// Remember the key value data of this vguimenu. That way we can display the old motd, if the client already watched an advert recently
 	new Handle:kv = CreateKeyValues("data");
-	WritePackCell(pack, _:kv);
 	
 	if (GetFeatureStatus(FeatureType_Native, "GetUserMessageType") == FeatureStatus_Available && GetUserMessageType() == UM_Protobuf)
 	{
@@ -643,6 +770,8 @@ public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:bf, const players[], playersN
 		}
 	}
 	KvRewind(kv);
+	
+	g_hDefaultMOTD[client] = kv;
 
 	return Plugin_Handled;
 }
@@ -650,13 +779,17 @@ public Action:OnMsgVGUIMenu(UserMsg:msg_id, Handle:bf, const players[], playersN
 public Action:PageClosed(client, const String:command[], argc)
 {
 	if (client == 0 || !IsClientInGame(client))
-		return Plugin_Continue;
+		return Plugin_Handled;
+	
+	#if defined SHOW_CONSOLE_MESSAGES
+	PrintToConsole(client, "Command closed_htmlpage detected.");
+	#endif
 	
 	switch (GetState(client))
 	{
 		case kAdDone:
 		{
-			return Plugin_Continue;
+			return Plugin_Handled;
 		}
 		case kViewingAd:
 		{
@@ -679,9 +812,15 @@ public Action:PageClosed(client, const String:command[], argc)
 					ClientCommand(client, "changeteam");
 			}
 		}
+		case kQueryingHTMLMotd:
+		{
+			// Keep the loading screen open until we queried the player
+			// This should be real quick
+			ShowMOTDPanelEx(client, "Loading...", "Loading...", MOTDPANEL_TYPE_TEXT, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
+		}
 	}
 	
-	return Plugin_Continue;
+	return Plugin_Handled;
 }
 
 public Action:LoadPage(Handle:timer, Handle:pack)
@@ -689,38 +828,33 @@ public Action:LoadPage(Handle:timer, Handle:pack)
 	ResetPack(pack);
 	new client = GetClientFromSerial(ReadPackCell(pack));
 	new trigger = ReadPackCell(pack);
-	new Handle:kv;
-	if(trigger == _:AD_TRIGGER_CONNECT)
-	{
-		kv = Handle:ReadPackCell(pack);
-	}
+	CloseHandle(pack);
 	
 	if (!client || (g_Game == kGameCSGO && GetState(client) == kViewingAd))
 	{
-		if(kv != INVALID_HANDLE)
-			CloseHandle(kv);
 		return Plugin_Stop;
 	}
 	
+	// Just reshow the ad immediately.
+	if(trigger == _:AD_TRIGGER_UNDEFINED)
+	{
+		ShowAdToPlayer(client, trigger);
+		return Plugin_Stop;
+	}
+	
+	// Don't show ads to admins at all.
 	if (GetConVarBool(g_ConVarImmunityEnabled) && CheckCommandAccess(client, "advertisement_immunity", ADMFLAG_RESERVATION, true))
 	{
 		// This guy now officially "viewed" the advert.
 		ChangeState(client, kAdDone);
-		if(kv != INVALID_HANDLE)
-		{
-			// Show the old motd
-			ShowVGUIPanelEx(client, "info", kv, true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
-			CloseHandle(kv);
-		}
+		ShowDefaultMotD(client);
 		return Plugin_Stop;
 	}
 	
 	// Database unavailable or feature disabled?
 	if(g_hDatabase == INVALID_HANDLE || GetConVarInt(g_ConVarAdInterval) <= 0)
 	{
-		if(kv != INVALID_HANDLE)
-			CloseHandle(kv);
-		ShowAdToPlayer(client, trigger);
+		GetFlashVersion(client, trigger);
 		return Plugin_Stop;
 	}
 	
@@ -731,13 +865,110 @@ public Action:LoadPage(Handle:timer, Handle:pack)
 	new Handle:hDataPack = CreateDataPack();
 	WritePackCell(hDataPack, GetClientSerial(client));
 	WritePackCell(hDataPack, trigger);
-	WritePackCell(hDataPack, _:kv);
 	
 	decl String:sQuery[512];
 	Format(sQuery, sizeof(sQuery), "SELECT lastview FROM `%spinion_playerview` WHERE steamid REGEXP '^STEAM_[0-9]:%s$';", DBPREFIX, sAuth[8]);
 	SQL_TQuery(g_hDatabase, SQL_CheckLastViewTime, sQuery, hDataPack, DBPrio_High);
 	
 	return Plugin_Stop;
+}
+
+CheckHTMLMotdDisabled(client, trigger)
+{
+	if(!g_PlayerHasHTMLDisabled[client][bChecked])
+	{
+		ShowMOTDPanelEx(client, "Loading...", "Loading...", MOTDPANEL_TYPE_TEXT, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
+		return;
+	}
+	
+	// Go to the next step, if we didn't finish already (player viewed at recently)
+	if(GetState(client) != kQueryingHTMLMotd)
+		return;
+	
+	ChangeState(client, kCheckFlash);
+	
+	// cl_disablehtmlmotd is disabled
+	if(g_PlayerHasHTMLDisabled[client][bSuccess] && g_PlayerHasHTMLDisabled[client][bIsDisabled])
+	{
+		ShowDefaultMotD(client);
+		UpdateServerStatistics(client);
+		return;
+	}
+	
+	// Try to get the flash player version, if the convarquery failed.
+	new Handle:pack = CreateDataPack();
+	WritePackCell(pack, GetClientSerial(client));
+	WritePackCell(pack, trigger);
+	LoadPage(INVALID_HANDLE, pack);
+}
+
+ShowDefaultMotD(client)
+{
+	// Don't show ads for this guy again.
+	ChangeState(client, kAdDone);
+	
+	if(g_hDefaultMOTD[client] != INVALID_HANDLE)
+	{
+		// This player has html motds disabled. Show him the motdfile_text file, like it's supposed to be.. the engine currently fails to do so.
+		if(g_PlayerHasHTMLDisabled[client][bChecked] && g_PlayerHasHTMLDisabled[client][bSuccess] && g_PlayerHasHTMLDisabled[client][bIsDisabled])
+			KvSetString(g_hDefaultMOTD[client], "msg", "motd_text");
+		
+		// Show the default motd.txt
+		ShowVGUIPanelEx(client, "info", g_hDefaultMOTD[client], true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
+		CloseHandle(g_hDefaultMOTD[client]);
+		g_hDefaultMOTD[client] = INVALID_HANDLE;
+	}
+}
+
+GetFlashVersion(client, trigger)
+{
+	new Handle:hPack = CreateDataPack();
+	WritePackCell(hPack, GetClientSerial(client));
+	WritePackCell(hPack, trigger);
+	ResetPack(hPack);
+	ChangeState(client, kCheckingFlash);
+	Flash_GetClientVersion(client, true, Flash_OnGetClientVersion, hPack);
+}
+
+public Flash_OnGetClientVersion(client, flashversion[4], bool:bError, any:pack)
+{
+	ResetPack(pack);
+	new target = GetClientFromSerial(ReadPackCell(pack));
+	new trigger = ReadPackCell(pack);
+	CloseHandle(pack);
+	
+	g_bErrorGettingFlash[target] = bError;
+	g_iFlashVersion[target] = flashversion;
+	
+	if(GetState(client) != kCheckingFlash)
+		return;
+	
+	// Only try to show adverts, if flash is actually installed.
+	if((!bError && flashversion[0] == 0 && flashversion[1] == 0 && flashversion[2] == 0 && flashversion[3] == 0)
+	// and he's from a counted country.
+	|| !IsClientFromValidCountry(target, "", 0))
+	{
+		ShowDefaultMotD(target);
+		UpdateServerStatistics(target);
+	}
+	else
+		ShowAdToPlayer(target, trigger);
+}
+
+bool:IsClientFromValidCountry(client, String:sCountry[], maxlen)
+{
+	decl String:sIP[16], String:sBuffer[64];
+	GetClientIP(client, sIP, sizeof(sIP));
+	if(!GeoipCountry(sIP, sBuffer, sizeof(sBuffer)))
+		strcopy(sBuffer, sizeof(sBuffer), "Unknown");
+	
+	strcopy(sCountry, maxlen, sBuffer);
+	
+	// Player is from a supported country
+	for(new i=0;i<sizeof(g_sSupportedCountries);i++)
+		if(StrEqual(sBuffer, g_sSupportedCountries[i]))
+			return true;
+	return false;
 }
 
 public Action:ClosePage(Handle:timer, Handle:pack)
@@ -842,18 +1073,48 @@ public Action:Timer_Restrict(Handle:timer, Handle:data)
 		return Plugin_Continue;
 	
 	new Float:flStartTime = ReadPackFloat(data);
-	new iCooldown = GetConVarInt(g_ConVarCooldown);
-	if (iCooldown > 30)
-		iCooldown = 30;
-	else if (iCooldown < 15)
-		iCooldown = 15;
-		
+	new iCooldown;
+	
+	new iMaxCooldown = GetConVarInt(g_ConVarMaxCooldown);
+	if (iMaxCooldown == -1)
+		iMaxCooldown = GetConVarInt(g_ConVarCooldown);
+	
+	if (g_iDynamicDisplayTime[client] > 0) //Got a valid time back from the backend
+	{
+		if (g_iDynamicDisplayTime[client] < iMaxCooldown) // ...AND the backend's value is Not Greater than the server's set max
+			iCooldown = g_iDynamicDisplayTime[client]; // Use backend's value
+		else // Backend's value was longer than the max
+		{
+			iCooldown = iMaxCooldown; // Use the max
+			// Apply our bounds
+			if (iCooldown > 30)
+				iCooldown = 30;
+			else if (iCooldown < 15)
+				iCooldown = 15;
+		}
+	}
+	else if (g_iDynamicDisplayTime[client] < 0) //Backend said there was nothing
+	{
+		iCooldown = 0; // Ditch the cooldown
+	}
+	else // The backend didn't respond with anything valid!
+	{
+		iCooldown = iMaxCooldown;
+		// Apply our bounds
+		if (iCooldown > 30)
+			iCooldown = 30;
+		else if (iCooldown < 15)
+			iCooldown = 15;
+	}
+	
 	iCooldown = iCooldown + 3;
 	
 	new timeleft = iCooldown - RoundToFloor(GetGameTime() - flStartTime);
 	if (timeleft > 0)
 	{
 		PrintCenterText(client, "You may continue in %d seconds or stay tuned for Pinion Pot of Gold.", timeleft);
+		// Prevent users from aliasing closed_htmlpage to circumvent motd redisplay.
+		//ShowMOTDPanelEx(client, MOTD_TITLE, "", MOTDPANEL_TYPE_URL, MOTDPANEL_CMD_NONE, false);
 		return Plugin_Continue;
 	}
 	
@@ -912,6 +1173,13 @@ ShowAdToPlayer(client, trigger)
 
 	if (GetState(client) != kViewingAd)
 	{
+		new timeleft;
+		GetMapTimeLeft(timeleft);
+		
+		// Only query the delay once before showing the motd.
+		if ((timeleft > 30 || timeleft < 0) && g_iIsMapActive && GetState(client) < kViewingAd)
+			GetClientAdvertDelay(client);
+		
 		decl String:szAuth[MAX_AUTH_LENGTH];
 		GetClientAuthString(client, szAuth, sizeof(szAuth));
 		
@@ -936,7 +1204,10 @@ ShowAdToPlayer(client, trigger)
 	ShowVGUIPanelEx(client, "info", kv, true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
 	CloseHandle(kv);
 	
-	new iCooldown = GetConVarInt(g_ConVarCooldown);
+	new iCooldown = GetConVarInt(g_ConVarMaxCooldown);
+	if (iCooldown == -1)
+		iCooldown = GetConVarInt(g_ConVarCooldown);
+	
 	new bool:bUseCooldown = (g_Game != kGameCSGO && g_Game != kGameL4D2 && g_Game != kGameL4D && iCooldown != 0);
 	if (bUseCooldown && GetState(client) != kViewingAd)
 	{
@@ -966,8 +1237,7 @@ stock UpdateLastViewTime(client)
 	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
 	
 	// For own tracking purposes..
-	Format(sQuery, sizeof(sQuery), "SELECT impressions FROM `%spinion_statistics` WHERE ip = \"%s\" AND port = %d AND date = CURDATE();", DBPREFIX, g_sServerIP, g_iServerPort);
-	SQL_TQuery(g_hDatabase, SQL_CheckImpressions, sQuery);
+	UpdateServerStatistics(client);
 }
 
 // SQL Stuff
@@ -995,13 +1265,32 @@ public SQL_OnConnect(Handle:owner, Handle:hndl, const String:error[], any:data)
 	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
 	
 	Format(sQuery, sizeof(sQuery), "CREATE TABLE IF NOT EXISTS `%spinion_statistics` (\
-									  `ip` varchar(64) NOT NULL,\
-									  `port` int(11) NOT NULL,\
+									  `sid` int(11) NOT NULL,\
 									  `date` date NOT NULL,\
 									  `impressions` int(11) NOT NULL,\
-									  PRIMARY KEY  (`ip`,`port`,`date`),\
-									  KEY `impressions` (`impressions`)\
+									  `valid_impressions` int(11) NOT NULL DEFAULT '0',\
+									  PRIMARY KEY (`sid`,`date`),\
+									  KEY `impressions` (`impressions`),\
+									  KEY `valid_impressions` (`valid_impressions`)\
 									) ENGINE=MyISAM DEFAULT CHARSET=utf8;", DBPREFIX);
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+	
+	Format(sQuery, sizeof(sQuery), "CREATE TABLE IF NOT EXISTS `%spinion_flashversion` (\
+									  `date` date NOT NULL,\
+									  `version` varchar(64) NOT NULL,\
+									  `count` int(11) NOT NULL DEFAULT '0',\
+									  PRIMARY KEY (`date`,`version`),\
+									  KEY `count` (`count`)\
+									) ENGINE=InnoDB DEFAULT CHARSET=utf8;", DBPREFIX);
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+	
+	Format(sQuery, sizeof(sQuery), "CREATE TABLE IF NOT EXISTS `%spinion_countries` (\
+									  `date` date NOT NULL,\
+									  `country` varchar(40) NOT NULL,\
+									  `count` int(11) NOT NULL DEFAULT '0',\
+									  PRIMARY KEY (`date`,`country`),\
+									  KEY `count` (`count`)\
+									) ENGINE=InnoDB DEFAULT CHARSET=utf8;", DBPREFIX);
 	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
 }
 
@@ -1010,7 +1299,6 @@ public SQL_CheckLastViewTime(Handle:owner, Handle:hndl, const String:error[], an
 	ResetPack(pack);
 	new client = GetClientFromSerial(ReadPackCell(pack));
 	new trigger = ReadPackCell(pack);
-	new Handle:kv = Handle:ReadPackCell(pack);
 	CloseHandle(pack);
 	
 	if(!client)
@@ -1018,9 +1306,7 @@ public SQL_CheckLastViewTime(Handle:owner, Handle:hndl, const String:error[], an
 	
 	if(hndl == INVALID_HANDLE || strlen(error) > 0)
 	{
-		if(kv != INVALID_HANDLE)
-			CloseHandle(kv);
-		ShowAdToPlayer(client, trigger);
+		GetFlashVersion(client, trigger);
 		LogError("Error getting last view time for player %N: %s", client, error);
 		return;
 	}
@@ -1028,9 +1314,7 @@ public SQL_CheckLastViewTime(Handle:owner, Handle:hndl, const String:error[], an
 	// He never watched an ad before. Just show it.
 	if(SQL_GetRowCount(hndl) == 0 || !SQL_FetchRow(hndl))
 	{
-		if(kv != INVALID_HANDLE)
-			CloseHandle(kv);
-		ShowAdToPlayer(client, trigger);
+		GetFlashVersion(client, trigger);
 		return;
 	}
 	
@@ -1038,29 +1322,78 @@ public SQL_CheckLastViewTime(Handle:owner, Handle:hndl, const String:error[], an
 	new iInterval = GetConVarInt(g_ConVarAdInterval) * 60;
 	if(iInterval <= 0) // Disabled?
 	{
-		if(kv != INVALID_HANDLE)
-			CloseHandle(kv);
-		ShowAdToPlayer(client, trigger);
+		GetFlashVersion(client, trigger);
 		return;
 	}
 	
 	// Player watched the advert recently. Don't disturb him again now.
 	if((GetTime() - iLastViewTime) < iInterval)
 	{
-		ChangeState(client, kAdDone);
-		if(kv != INVALID_HANDLE)
-		{
-			ShowVGUIPanelEx(client, "info", kv, true, USERMSG_BLOCKHOOKS|USERMSG_RELIABLE);
-			CloseHandle(kv);
-		}
+		ShowDefaultMotD(client);
 		return;
 	}
 	
-	if(kv != INVALID_HANDLE)
-		CloseHandle(kv);
-	
 	// He didn't watch it recently. Have him watch now.
-	ShowAdToPlayer(client, trigger);
+	GetFlashVersion(client, trigger);
+}
+
+UpdateServerStatistics(client)
+{
+	if(!g_bStatsTracked[client])
+	{
+		// Only update the stats once per user. We don't reshow ads during the round but only on join, so it's ok.
+		g_bStatsTracked[client] = true;
+		
+		decl String:sBuffer[64];
+		// Player is from a supported country
+		new bool:bGoodCountry = IsClientFromValidCountry(client, sBuffer, sizeof(sBuffer));
+		
+		// And has flash installed
+		new bool:bFlashInstalled;
+		if(!g_bErrorGettingFlash[client] && !(g_iFlashVersion[client][0] == 0 && g_iFlashVersion[client][1] == 0 && g_iFlashVersion[client][2] == 0 && g_iFlashVersion[client][3] == 0))
+			bFlashInstalled = true;
+		
+		// Got html motds enabled.
+		new bool:bHTMLEnabled;
+		// HTML MotD enabled
+		if((g_PlayerHasHTMLDisabled[client][bChecked] && g_PlayerHasHTMLDisabled[client][bSuccess] && !g_PlayerHasHTMLDisabled[client][bIsDisabled])
+		// or the query failed and we tried to display the ad anyway.
+		|| (g_PlayerHasHTMLDisabled[client][bChecked] && !g_PlayerHasHTMLDisabled[client][bSuccess]))
+			bHTMLEnabled = true;
+		
+		new bDoesNotCount = !bGoodCountry || !bFlashInstalled || !bHTMLEnabled;
+		
+		decl String:sQuery[512];
+		
+		// Only update the impressions, if we actually were able to serve ads
+		if(bHTMLEnabled)
+		{
+			Format(sQuery, sizeof(sQuery), "SELECT impressions FROM `%spinion_statistics` WHERE ip = \"%s\" AND port = %d AND date = CURDATE();", DBPREFIX, g_sServerIP, g_iServerPort);
+			SQL_TQuery(g_hDatabase, SQL_CheckImpressions, sQuery, bDoesNotCount);
+		}
+		
+		// Track countries
+		new Handle:hPack = CreateDataPack();
+		WritePackString(hPack, sBuffer);
+		ResetPack(hPack);
+		
+		Format(sQuery, sizeof(sQuery), "SELECT count FROM `%spinion_countries` WHERE date = CURDATE() AND country = \"%s\";", DBPREFIX, sBuffer);
+		SQL_TQuery(g_hDatabase, SQL_CheckCountry, sQuery, hPack);
+		
+		// Track flash player versions
+		if(!bHTMLEnabled)
+			Format(sBuffer, sizeof(sBuffer), "HTML disabled");
+		else if(g_bErrorGettingFlash[client])
+			Format(sBuffer, sizeof(sBuffer), "Error");
+		else
+			Format(sBuffer, sizeof(sBuffer), "%d.%d.%d.%d", g_iFlashVersion[client][0], g_iFlashVersion[client][1], g_iFlashVersion[client][2], g_iFlashVersion[client][3]);
+		hPack = CreateDataPack();
+		WritePackString(hPack, sBuffer);
+		ResetPack(hPack);
+		
+		Format(sQuery, sizeof(sQuery), "SELECT count FROM `%spinion_flashversion` WHERE date = CURDATE() AND version = \"%s\";", DBPREFIX, sBuffer);
+		SQL_TQuery(g_hDatabase, SQL_CheckFlashVersion, sQuery, hPack);
+	}
 }
 
 public SQL_CheckImpressions(Handle:owner, Handle:hndl, const String:error[], any:data)
@@ -1074,11 +1407,61 @@ public SQL_CheckImpressions(Handle:owner, Handle:hndl, const String:error[], any
 	decl String:sQuery[256];
 	if(SQL_GetRowCount(hndl) == 0)
 	{
-		Format(sQuery, sizeof(sQuery), "INSERT INTO `%spinion_statistics` (ip, port, date, impressions) VALUES (\"%s\", %d, CURDATE(), 1);", DBPREFIX, g_sServerIP, g_iServerPort);
+		Format(sQuery, sizeof(sQuery), "INSERT INTO `%spinion_statistics` (ip, port, date, impressions, valid_impressions) VALUES (%d, CURDATE(), 1, %d);", DBPREFIX, g_sServerIP, g_iServerPort, (data?0:1));
 	}
 	else
 	{
-		Format(sQuery, sizeof(sQuery), "UPDATE `%spinion_statistics` SET impressions = impressions+1 WHERE ip = \"%s\" AND port = %d AND date = CURDATE();", DBPREFIX, g_sServerIP, g_iServerPort);
+		Format(sQuery, sizeof(sQuery), "UPDATE `%spinion_statistics` SET impressions = impressions+1, valid_impressions = valid_impressions+%d WHERE ip = \"%s\" AND port = %d AND date = CURDATE();", DBPREFIX, (data?0:1), g_sServerIP, g_iServerPort);
+	}
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+}
+
+public SQL_CheckFlashVersion(Handle:owner, Handle:hndl, const String:error[], any:pack)
+{
+	if(hndl == INVALID_HANDLE || strlen(error) > 0)
+	{
+		CloseHandle(pack);
+		LogError("Error checking flashversions: %s", error);
+		return;
+	}
+	
+	decl String:sBuffer[64];
+	ReadPackString(pack, sBuffer, sizeof(sBuffer));
+	CloseHandle(pack);
+	
+	decl String:sQuery[256];
+	if(SQL_GetRowCount(hndl) == 0)
+	{
+		Format(sQuery, sizeof(sQuery), "INSERT INTO `%spinion_flashversion` (date, version, count) VALUES (CURDATE(), \"%s\", 1);", DBPREFIX, sBuffer);
+	}
+	else
+	{
+		Format(sQuery, sizeof(sQuery), "UPDATE `%spinion_flashversion` SET count = count+1 WHERE date = CURDATE() AND version = \"%s\";", DBPREFIX, sBuffer);
+	}
+	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
+}
+
+public SQL_CheckCountry(Handle:owner, Handle:hndl, const String:error[], any:pack)
+{
+	if(hndl == INVALID_HANDLE || strlen(error) > 0)
+	{
+		CloseHandle(pack);
+		LogError("Error checking flashversions: %s", error);
+		return;
+	}
+	
+	decl String:sBuffer[64];
+	ReadPackString(pack, sBuffer, sizeof(sBuffer));
+	CloseHandle(pack);
+	
+	decl String:sQuery[256];
+	if(SQL_GetRowCount(hndl) == 0)
+	{
+		Format(sQuery, sizeof(sQuery), "INSERT INTO `%spinion_countries` (date, country, count) VALUES (CURDATE(), \"%s\", 1);", DBPREFIX, sBuffer);
+	}
+	else
+	{
+		Format(sQuery, sizeof(sQuery), "UPDATE `%spinion_countries` SET count = count+1 WHERE date = CURDATE() AND country = \"%s\";", DBPREFIX, sBuffer);
 	}
 	SQL_TQuery(g_hDatabase, SQL_DoNothing, sQuery);
 }
@@ -1090,4 +1473,160 @@ public SQL_DoNothing(Handle:owner, Handle:hndl, const String:error[], any:data)
 		LogError("Error updating time or statistics: %s", error);
 		return;
 	}
+}
+
+// Code for Dynamic Durations
+GetClientAdvertDelay(client)
+{
+	g_iNumQueryAttempts[client] = 1;
+	g_iCurrentIteration[client] = 1;
+	g_iDynamicDisplayTime[client] = 0;
+	
+	new String:Domain[] = "adback.pinion.gg";
+	new String:sQueryURL[] = "duration/";
+	
+	//Create the pack and fill it with data
+	new Handle:hPack = CreateDataPack();
+	WritePackString(hPack, sQueryURL); //Remote File
+	WritePackString(hPack, Domain); //Domain
+	WritePackCell(hPack, GetClientSerial(client));
+
+	//Create a socket connection and pass the pack handle
+	new Handle:socket = SocketCreate(SOCKET_TCP, OnSocketError);
+	SocketSetArg(socket, hPack);
+	SocketConnect(socket, OnSocketConnected, OnSocketReceive, OnSocketDisconnected, Domain, 80);
+}
+
+public OnSocketConnected(Handle:socket, any:hPack)
+{
+	new String:DownloadFrom[512], String:Domain[512], String:SteamID[32];
+	
+	ResetPack(hPack);
+	ReadPackString(hPack, DownloadFrom, sizeof(DownloadFrom)); //Remote path
+	ReadPackString(hPack, Domain, sizeof(Domain)); //Remote
+	
+	new client = GetClientFromSerial(ReadPackCell(hPack));
+	if (client == 0)
+		return;
+	
+	GetClientAuthString(client, SteamID, sizeof(SteamID));
+	
+	
+	new String:buffer[1024];
+	Format(buffer, sizeof(buffer), "GET /%s%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", DownloadFrom, SteamID, Domain);
+	#if defined SHOW_CONSOLE_MESSAGES
+	PrintToConsole(client, "\n\nQuerying url: %s/%s%s", Domain, DownloadFrom, SteamID);
+	#endif
+	SocketSend(socket, buffer);
+}
+
+public OnSocketReceive(Handle:socket, String:receiveData[], const dataSize, any:hPack)
+{
+	new String:DownloadFrom[512], String:Domain[512];
+	
+	ResetPack(hPack);
+	ReadPackString(hPack, DownloadFrom, sizeof(DownloadFrom)); //Remote path
+	ReadPackString(hPack, Domain, sizeof(Domain)); //Remote domain
+	new client = GetClientFromSerial(ReadPackCell(hPack));
+	if (client == 0)
+		return;
+
+	new pos = 0;
+	if (g_iCurrentIteration[client] == 1)
+	{
+		pos = 4;
+		while (pos < dataSize && !(receiveData[pos-4] == '\r' && receiveData[pos-3] == '\n' && receiveData[pos-2] == '\r' && receiveData[pos-1] == '\n'))
+			pos++;
+
+		/*new String:szHeader[pos-4];
+		strcopy(szHeader, pos-4, receiveData);
+		new lenPos = StrContains(szHeader, "Content-Length: ", false);
+		if (lenPos != -1)
+		{
+			lenPos += 16;
+			new String:szContentLength[32];
+			new x = 0;
+			while (szHeader[lenPos] != '\r' && szHeader[lenPos+1] != '\n')
+				szContentLength[x++] = szHeader[lenPos++];
+			
+			szContentLength[x] = '\0';
+		}*/
+	}
+
+	new String:sData[4096];
+	strcopy(sData, sizeof(sData), receiveData[pos]);
+	TrimString(sData);
+	
+	#if defined SHOW_CONSOLE_MESSAGES
+	PrintToConsole(client, "Query returned '%s'", sData);
+	#endif
+	if (!StrEqual(sData, ""))
+	{
+		new queryResult = StringToInt(sData);
+		if (queryResult == 0)
+		{
+			new Handle:pack = CloneHandle(hPack);
+			CreateTimer(QUERY_DELAY, QueryAgain, pack, TIMER_FLAG_NO_MAPCHANGE);
+		}
+		else
+		{
+			#if defined SHOW_CONSOLE_MESSAGES
+			PrintToConsole(client, "Query finished, StringToInt returned %i", queryResult);
+			#endif
+			//Update the delay timer
+			g_iDynamicDisplayTime[client] = queryResult;
+		}
+	}
+	
+	g_iCurrentIteration[client]++;
+}
+
+// QueryAgain decides if a query should be reattempted and creates the query if yes
+public Action:QueryAgain(Handle:timer, Handle:hPack)
+{
+	new String:Domain[512];
+	ResetPack(hPack);
+	ReadPackString(hPack, Domain, sizeof(Domain));
+	ReadPackString(hPack, Domain, sizeof(Domain));
+	new client = GetClientFromSerial(ReadPackCell(hPack));
+	if (client == 0)
+	{
+		CloseHandle(hPack);
+		return;
+	}
+	
+	if (g_iNumQueryAttempts[client] >= MAX_QUERY_ATTEMPTS)
+	{
+		#if defined SHOW_CONSOLE_MESSAGES
+		PrintToConsole(client, "Query failed: StringToInt returned 0.  Giving up after %i attempts.", g_iNumQueryAttempts[client]);
+		#endif
+		CloseHandle(hPack);
+		g_iNumQueryAttempts[client] = 1;
+	}
+	else
+	{
+		#if defined SHOW_CONSOLE_MESSAGES
+		PrintToConsole(client, "Query #%i failed: StringToInt returned 0.  Attempting query again.", g_iNumQueryAttempts[client]);
+		#endif
+		g_iNumQueryAttempts[client] ++;
+		
+		//Create a socket connection and pass the pack handle
+		g_iCurrentIteration[client] = 1;
+		new Handle:socket = SocketCreate(SOCKET_TCP, OnSocketError);
+		SocketSetArg(socket, hPack);
+		SocketConnect(socket, OnSocketConnected, OnSocketReceive, OnSocketDisconnected, Domain, 80);
+	}
+}
+
+public OnSocketError(Handle:socket, const errorType, const errorNum, any:hPack)
+{
+	LogError("Something went wrong querying the backend.  Socket error %d [errno %d]", errorType, errorNum);
+	CloseHandle(hPack);
+	CloseHandle(socket);
+}
+
+public OnSocketDisconnected(Handle:socket, any:hPack)
+{
+	CloseHandle(hPack);
+	CloseHandle(socket);
 }
